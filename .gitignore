@@ -4,6 +4,11 @@
 # 保留 Git 忽略清单与说明文档
 !/.gitignore
 !/README.md
+!/requirements.md
+
+# 保留文档对比图资源
+!/docs/
+!/docs/**
 
 # 保留主程序及核心排版引擎
 !/textbook_typesetter.py
