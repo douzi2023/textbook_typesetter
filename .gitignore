@@ -1,0 +1,11 @@
+# 默认忽略所有文件与目录
+/*
+
+# 保留 Git 忽略清单与说明文档
+!/.gitignore
+!/README.md
+
+# 保留主程序及核心排版引擎
+!/textbook_typesetter.py
+!/cjk_layout_engine.py
+!/textbook.typ
