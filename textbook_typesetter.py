@@ -32,63 +32,123 @@ from cjk_layout_engine import (
 )
 
 
+def _parse_fn_key_to_id(key: Any) -> int:
+    """将词典键（整数、数字字符串、带圈序号、[n]）统一转换为整数 ID"""
+    if isinstance(key, int):
+        return key
+    s = str(key).strip()
+    if s.isdigit():
+        return int(s)
+    if s in CIRCLE_SYMBOLS:
+        return CIRCLE_SYMBOLS.index(s) + 1
+    m = re.match(r'^\[(\d+)\]$', s)
+    if m:
+        return int(m.group(1))
+    return 1
+
+
+def _format_fn_dict_entry(val: Any) -> str:
+    """将词典值转换为标准注释文本（若为 {词条: 释义} 映射则自动添加 〔〕）"""
+    if isinstance(val, dict) and len(val) > 0:
+        term, desc = next(iter(val.items()))
+        term_str = str(term).strip()
+        desc_str = str(desc).strip()
+        if term_str.startswith('〔') and term_str.endswith('〕'):
+            return f"{term_str}{desc_str}"
+        return f"〔{term_str}〕{desc_str}"
+    if isinstance(val, (list, tuple)) and len(val) >= 2:
+        term_str = str(val[0]).strip()
+        desc_str = str(val[1]).strip()
+        if term_str.startswith('〔') and term_str.endswith('〕'):
+            return f"{term_str}{desc_str}"
+        return f"〔{term_str}〕{desc_str}"
+    return str(val).strip()
+
+
 def parse_markdown_lesson(md_path: str) -> Tuple[Dict[str, Any], str, Dict[int, Tuple[str, str]], str]:
     """
     解析课文 Markdown 文件，提取 Frontmatter、正文、字词出处注释、学习提示
+    支持灵活的标题格式（如 ## 正文 / ### 【课文正文】 / 省略正文标题）
+    注释支持 YAML/Python 词典格式，自动为 {词条: 释义} 添加 〔〕
     """
     with open(md_path, 'r', encoding='utf-8') as f:
         raw_text = f.read()
 
     meta = {}
     content = raw_text
-    if raw_text.startswith('---'):
-        parts = raw_text.split('---', 2)
-        if len(parts) >= 3:
+    if raw_text.lstrip().startswith('---'):
+        parts = re.split(r'^---\s*$', raw_text.lstrip(), maxsplit=2, flags=re.MULTILINE)
+        if len(parts) >= 3 and parts[0].strip() == '':
             meta = yaml.safe_load(parts[1]) or {}
             content = parts[2].strip()
 
-    # 提取正文
-    body_text = ""
-    if '### 【课文正文】' in content:
-        b_part = content.split('### 【课文正文】')[1]
-        if '### 【课文字词与出处注释】' in b_part:
-            body_text = b_part.split('### 【课文字词与出处注释】')[0].strip()
-        elif '### 【学习提示】' in b_part:
-            body_text = b_part.split('### 【学习提示】')[0].strip()
-        else:
-            body_text = b_part.strip()
-    body_text = re.sub(r'<!--.*?-->', '', body_text).strip()
-    # 彻底去除正文末尾的水平分割线
-    body_text = re.sub(r'\n\s*---\s*\n', '\n\n', body_text)
-    body_text = re.sub(r'\s*---\s*$', '', body_text).strip()
+    # 剥离 HTML 注释
+    content = re.sub(r'<!--.*?-->', '', content, flags=re.DOTALL)
 
-    # 提取注释
-    fn_dict = {}
-    if '### 【课文字词与出处注释】' in content:
-        fn_part = content.split('### 【课文字词与出处注释】')[1]
-        if '### 【学习提示】' in fn_part:
-            fn_part = fn_part.split('### 【学习提示】')[0].strip()
-        fn_part = re.sub(r'---', '', fn_part).strip()
+    # 按章节标题灵活切分（不再强绑定 ### 【...】 固定写法）
+    sections = {'body': [], 'footnotes': [], 'hint': []}
+    current_sec = 'body'
 
-        for line in fn_part.splitlines():
+    re_body_hdr = re.compile(r'^#{1,6}\s*【?(?:课文)?正文】?\s*$')
+    re_fn_hdr = re.compile(r'^#{1,6}\s*【?(?:课文字词与出处|课文字词|字词与出处|字词|出处)?注释】?\s*$')
+    re_hint_hdr = re.compile(r'^#{1,6}\s*【?学习提示】?\s*$')
+
+    for line in content.splitlines():
+        stripped = line.strip()
+        if re_body_hdr.match(stripped):
+            current_sec = 'body'
+            continue
+        if re_fn_hdr.match(stripped):
+            current_sec = 'footnotes'
+            continue
+        if re_hint_hdr.match(stripped):
+            current_sec = 'hint'
+            continue
+        sections[current_sec].append(line)
+
+    def _clean_hr(lines_list: List[str]) -> str:
+        text = '\n'.join(lines_list).strip()
+        text = re.sub(r'^\s*---\s*$', '', text, flags=re.MULTILINE).strip()
+        return text
+
+    body_text = _clean_hr(sections['body'])
+    hint_text = _clean_hr(sections['hint'])
+    fn_raw = _clean_hr(sections['footnotes'])
+
+    # 提取注释（优先支持 Frontmatter footnotes 或 注释区词典格式，兼容旧版逐行格式）
+    fn_dict: Dict[int, Tuple[str, str]] = {}
+
+    raw_fn_mapping = None
+    if isinstance(meta.get('footnotes'), dict):
+        raw_fn_mapping = meta['footnotes']
+    elif fn_raw:
+        # 剥离可选的 ```yaml / ```python / ``` 代码块围栏
+        fn_clean = re.sub(r'^```[a-zA-Z]*\s*\n', '', fn_raw.strip())
+        fn_clean = re.sub(r'\n```\s*$', '', fn_clean).strip()
+        try:
+            loaded = yaml.safe_load(fn_clean)
+            if isinstance(loaded, dict):
+                raw_fn_mapping = loaded
+        except Exception:
+            raw_fn_mapping = None
+
+    if raw_fn_mapping is not None:
+        for k, v in raw_fn_mapping.items():
+            fid = _parse_fn_key_to_id(k)
+            sym = CIRCLE_SYMBOLS[fid - 1] if 1 <= fid <= len(CIRCLE_SYMBOLS) else f"[{fid}]"
+            txt = _format_fn_dict_entry(v)
+            fn_dict[fid] = (sym, txt)
+    elif fn_raw:
+        # 向后兼容旧版逐行注释格式
+        for line in fn_raw.splitlines():
             line = line.strip()
             if not line:
                 continue
             m = re.match(r'^([①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳㉑㉒㉓㉔㉕㉖㉗㉘㉙㉚㉛㉜㉝㉞㉟㊱㊲㊳㊴㊵㊶㊷㊸㊹㊺㊻㊼㊽㊾㊿]|\[\d+\])\s*(.*)', line)
             if m:
                 sym, txt = m.group(1), m.group(2)
-                # 计算数字 ID
-                if sym in CIRCLE_SYMBOLS:
-                    fid = CIRCLE_SYMBOLS.index(sym) + 1
-                else:
-                    sub_m = re.match(r'\[(\d+)\]', sym)
-                    fid = int(sub_m.group(1)) if sub_m else 1
+                fid = _parse_fn_key_to_id(sym)
                 fn_dict[fid] = (sym, txt)
-
-    # 提取学习提示
-    hint_text = ""
-    if '### 【学习提示】' in content:
-        hint_text = content.split('### 【学习提示】')[1].strip()
 
     return meta, body_text, fn_dict, hint_text
 
